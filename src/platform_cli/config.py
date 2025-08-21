@@ -3,7 +3,7 @@
 from typing import Optional
 
 DEFAULT_TAGS = {
-    "CreatedBy": "platform-cli",
+    "CreatedBy": "project-cli",
 }
 
 def build_tag_list(owner: str, project: Optional[str] = None, env: Optional[str] = None):

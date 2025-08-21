@@ -1,10 +1,11 @@
 # src/platform_cli/aws/ec2.py
 
 from typing import Optional, Dict, List
+import getpass
+import traceback
 
 import click
 import boto3
-import traceback
 from botocore.exceptions import (
     ClientError,
     NoCredentialsError,
@@ -35,9 +36,15 @@ def _session_from(profile: Optional[str]):
     return boto3.Session()
 
 
+def _effective_region(session: boto3.Session, region: Optional[str]) -> str:
+    """Pick a safe region: CLI option > profile default > us-east-1."""
+    return region or session.region_name or "us-east-1"
+
+
 def _count_running_cli_instances(session: boto3.Session, region: Optional[str]) -> int:
-    """Count running instances created by this CLI (tag CreatedBy=platform-cli)."""
-    client = session.client("ec2", region_name=region)
+    """Count running instances created by this CLI (tag CreatedBy=project-cli)."""
+    effective_region = _effective_region(session, region)
+    client = session.client("ec2", region_name=effective_region)
     filters = [
         {"Name": "tag:CreatedBy", "Values": [DEFAULT_TAGS["CreatedBy"]]},
         {"Name": "instance-state-name", "Values": ["running"]},
@@ -54,7 +61,8 @@ def _resolve_latest_ami(session: boto3.Session, region: Optional[str], os_name: 
     Resolve latest AMI via public SSM parameter names.
     os_name: 'amzn' (Amazon Linux 2) or 'ubuntu'
     """
-    ssm = session.client("ssm", region_name=region)
+    effective_region = _effective_region(session, region)
+    ssm = session.client("ssm", region_name=effective_region)
     candidates: List[str] = []
     if os_name == "ubuntu":
         # prefer 24.04 LTS; fallback to 22.04 LTS
@@ -88,27 +96,18 @@ def _run_instance(
     owner: str,
     project: Optional[str],
     env: Optional[str],
-    dry_run: bool,
 ) -> Dict[str, str]:
-    """Run a single instance with tags. Supports EC2 DryRun."""
-    client = session.client("ec2", region_name=region)
+    """Run a single instance with tags."""
+    effective_region = _effective_region(session, region)
+    client = session.client("ec2", region_name=effective_region)
     tags = build_tag_list(owner, project, env)
-    try:
-        resp = client.run_instances(
-            ImageId=ami_id,
-            InstanceType=instance_type,
-            MinCount=1,
-            MaxCount=1,
-            TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
-            DryRun=dry_run,
-        )
-    except ClientError as e:
-        # DryRunOperation means permissions would allow it in a real call
-        if "DryRunOperation" in str(e) and dry_run:
-            return {"InstanceId": "(dry-run)", "ImageId": ami_id}
-        raise
-    if dry_run:
-        return {"InstanceId": "(dry-run)", "ImageId": ami_id}
+    resp = client.run_instances(
+        ImageId=ami_id,
+        InstanceType=instance_type,
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{"ResourceType": "instance", "Tags": tags}],
+    )
     inst = resp["Instances"][0]
     return {"InstanceId": inst["InstanceId"], "ImageId": ami_id}
 
@@ -123,7 +122,7 @@ def _run_instance(
 @click.option("--owner", default=None, help="Filter by Owner tag (optional)")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
 def list_instances(profile, region, owner, debug):
-    """List EC2 instances created by this CLI (tagged CreatedBy=platform-cli)."""
+    """List EC2 instances created by this CLI (tagged CreatedBy=project-cli)."""
     # 1) Session & region resolution (safe defaults)
     try:
         session = _session_from(profile)
@@ -131,7 +130,7 @@ def list_instances(profile, region, owner, debug):
         click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
         raise SystemExit(2)
 
-    effective_region = region or session.region_name or "us-east-1"
+    effective_region = _effective_region(session, region)
     client = session.client("ec2", region_name=effective_region)
 
     # 2) Build filters (tagged by this CLI, optional owner)
@@ -155,7 +154,7 @@ def list_instances(profile, region, owner, debug):
                     click.echo(f"{inst_id}\t{state}\t{itype}")
 
         if not found:
-            click.echo("No instances found (tag CreatedBy=platform-cli).")
+            click.echo("No instances found (tag CreatedBy=project-cli).")
 
     except NoCredentialsError:
         click.echo("ERROR: No AWS credentials. Run `aws configure` or use --profile.", err=True)
@@ -188,100 +187,250 @@ def list_instances(profile, region, owner, debug):
         raise SystemExit(2)
 
 
-@ec2.command("create")
+@ec2.command("create", context_settings=dict(help_option_names=["-h", "--help"]))
+# Put --examples BEFORE positionals so it can short-circuit without args
+@click.option("--examples", is_flag=True, help="Show usage examples and exit")
+@click.argument("os_name", required=False, type=click.Choice(["amazon-linux", "ubuntu"], case_sensitive=False))
+@click.argument("instance_type", required=False, type=click.Choice(sorted(ALLOWED_INSTANCE_TYPES)))
 @click.option("--profile", default=None, help="AWS profile (falls back to AWS_PROFILE)")
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
-@click.option("--owner", required=True, help="Owner tag value")
+@click.option("--owner", default=getpass.getuser(), show_default=True, help="Owner tag value")
 @click.option("--project", default=None, help="Project tag")
 @click.option("--env", default=None, help="Environment tag")
-@click.option(
-    "--instance-type",
-    "instance_type",
-    type=click.Choice(sorted(ALLOWED_INSTANCE_TYPES)),
-    required=True,
-    help="Allowed: t3.micro, t2.small",
-)
-@click.option(
-    "--os",
-    "os_name",
-    type=click.Choice(["amzn", "ubuntu"]),
-    default="amzn",
-    help="Base image: amzn (Amazon Linux 2) or ubuntu",
-)
-@click.option(
-    "--dry-run/--no-dry-run",
-    default=False,
-    help="Show what would happen without calling AWS",
-)
-def create_instance(profile, region, owner, project, env, instance_type, os_name, dry_run):
+@click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
+def create_instance(examples, os_name, instance_type, profile, region, owner, project, env, debug):
     """
-    Create a single EC2 instance with required tags and safety checks:
-    - instance type whitelist
-    - max 2 running instances created by this CLI
-    - resolve latest AMI via SSM
+    Create a single EC2 instance with required tags and safety checks.
+
+    POSITIONAL:
+      OS_NAME         amazon-linux|ubuntu
+      INSTANCE_TYPE   t3.micro|t2.small
     """
-    # Local validation (extra guard; click.Choice already restricts values)
+    if examples:
+        click.echo(
+            "Examples:\n"
+            "  project-cli ec2 create amazon-linux t3.micro --region us-east-1\n"
+            "  project-cli ec2 create ubuntu t2.small --owner alice --project demo --env dev\n"
+        )
+        return
+
+    # Ensure required args present (so --examples can be called without args)
+    if not os_name or not instance_type:
+        click.echo("ERROR: Missing required arguments OS_NAME and INSTANCE_TYPE.\nTry 'project-cli ec2 create -h' for help.", err=True)
+        raise SystemExit(2)
+
+    # normalize os_name -> internal 'amzn' or 'ubuntu'
+    os_norm = os_name.lower()
+    if os_norm == "amazon-linux":
+        os_norm = "amzn"
+
     if instance_type not in ALLOWED_INSTANCE_TYPES:
         click.echo(f"ERROR: instance_type must be one of {sorted(ALLOWED_INSTANCE_TYPES)}", err=True)
+        raise SystemExit(2)
+
+    # Create session and effective region
+    try:
+        session = _session_from(profile)
+    except ProfileNotFound:
+        click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    effective_region = _effective_region(session, region)
+
+    # Enforce running-instance cap (max 2 running, created by this CLI)
+    try:
+        running = _count_running_cli_instances(session, effective_region)
+    except NoCredentialsError:
+        click.echo("ERROR: No AWS credentials. Run `aws configure` or set AWS_PROFILE.", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except ClientError as e:
+        click.echo(f"AWS error (describe_instances): {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    if running >= 2:
+        click.echo(f"Limit reached: {running} running instances created by project-cli (max 2).", err=True)
+        raise SystemExit(2)
+
+    # Resolve AMI via SSM
+    try:
+        ami_id = _resolve_latest_ami(session, effective_region, os_norm)
+    except NoCredentialsError:
+        click.echo("ERROR: No AWS credentials. Run `aws configure` or set AWS_PROFILE.", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except Exception as e:
+        click.echo(f"AMI resolution failed: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    # Create instance
+    try:
+        result = _run_instance(
+            session=session,
+            region=effective_region,
+            ami_id=ami_id,
+            instance_type=instance_type,
+            owner=owner,
+            project=project,
+            env=env,
+        )
+    except NoCredentialsError:
+        click.echo("ERROR: No AWS credentials. Run `aws configure` or set AWS_PROFILE.", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except ClientError as e:
+        click.echo(f"EC2 RunInstances failed: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except Exception as e:
+        click.echo(f"Unexpected error: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    click.echo(f"Instance created: {result['InstanceId']} (ImageId={result['ImageId']})")
+
+
+# --- EC2 START (strict) ---
+@ec2.command("start", context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option("--examples", is_flag=True, help="Show usage examples and exit")
+@click.argument("instance_id", required=False)
+@click.option("--profile", default=None, help="AWS profile (falls back to AWS_PROFILE)")
+@click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
+@click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
+def start_instance(examples, instance_id, profile, region, debug):
+    """
+    Start an EC2 instance by ID, but ONLY if it was created by this CLI.
+
+    POSITIONAL:
+      INSTANCE_ID   e.g., i-0123456789abcdef0
+    """
+    if examples:
+        click.echo(
+            "Examples:\n"
+            "  project-cli ec2 start i-0123456789abcdef0 --region us-east-1\n"
+            "  project-cli ec2 start i-0abc... --profile myprofile\n"
+        )
+        return
+
+    if not instance_id:
+        click.echo("ERROR: Missing required INSTANCE_ID.\nTry 'project-cli ec2 start -h' for help.", err=True)
         raise SystemExit(2)
 
     try:
         session = _session_from(profile)
     except ProfileNotFound:
         click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
+        if debug:
+            traceback.print_exc()
         raise SystemExit(2)
 
-    # Enforce running-instance cap
+    effective_region = _effective_region(session, region)
+    client = session.client("ec2", region_name=effective_region)
+
     try:
-        running = _count_running_cli_instances(session, region)
+        desc = client.describe_instances(InstanceIds=[instance_id])
+        all_tags = {t["Key"]: t["Value"]
+                    for r in desc.get("Reservations", [])
+                    for i in r.get("Instances", [])
+                    for t in i.get("Tags", [])}
+        if all_tags.get("CreatedBy") != DEFAULT_TAGS["CreatedBy"]:
+            click.echo("ERROR: Instance is not tagged CreatedBy=project-cli. Refusing to start.", err=True)
+            raise SystemExit(2)
+
+        client.start_instances(InstanceIds=[instance_id])
+        click.echo(f"Start initiated for {instance_id} (region={effective_region})")
+
     except NoCredentialsError:
-        click.echo("ERROR: No AWS credentials. Run `aws configure` or set AWS_PROFILE.", err=True)
+        click.echo("ERROR: No AWS credentials. Run `aws configure` or use --profile.", err=True)
+        if debug:
+            traceback.print_exc()
         raise SystemExit(2)
     except ClientError as e:
-        click.echo(f"AWS error (describe_instances): {e}", err=True)
-        raise SystemExit(2)
-
-    if running >= 2:
-        click.echo(f"Limit reached: {running} running instances created by platform-cli (max 2).", err=True)
-        raise SystemExit(2)
-
-    # Resolve AMI
-    try:
-        ami_id = _resolve_latest_ami(session, region, os_name)
-    except NoCredentialsError:
-        click.echo("ERROR: No AWS credentials. Run `aws configure` or set AWS_PROFILE.", err=True)
+        click.echo(f"AWS error (start_instances): {e}", err=True)
+        if debug:
+            traceback.print_exc()
         raise SystemExit(2)
     except Exception as e:
-        click.echo(f"AMI resolution failed: {e}", err=True)
+        click.echo(f"Unexpected error: {e}", err=True)
+        if debug:
+            traceback.print_exc()
         raise SystemExit(2)
 
-    # Create instance (or dry-run)
-    try:
-        result = _run_instance(
-            session=session,
-            region=region,
-            ami_id=ami_id,
-            instance_type=instance_type,
-            owner=owner,
-            project=project,
-            env=env,
-            dry_run=dry_run,
-        )
-    except NoCredentialsError:
-        click.echo("ERROR: No AWS credentials. Run `aws configure` or set AWS_PROFILE.", err=True)
-        raise SystemExit(2)
-    except ClientError as e:
-        click.echo(f"EC2 RunInstances failed: {e}", err=True)
-        raise SystemExit(2)
 
-    if dry_run:
-        click.echo("[DRY-RUN] Would create instance:")
-        click.echo(f"[DRY-RUN]   ImageId={ami_id}")
-        click.echo(f"[DRY-RUN]   InstanceType={instance_type}")
+# --- EC2 STOP (strict) ---
+@ec2.command("stop", context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option("--examples", is_flag=True, help="Show usage examples and exit")
+@click.argument("instance_id", required=False)
+@click.option("--profile", default=None, help="AWS profile (falls back to AWS_PROFILE)")
+@click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
+@click.option("--force", is_flag=True, help="Force stop (equivalent to hard power-off)")
+@click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
+def stop_instance(examples, instance_id, profile, region, force, debug):
+    """
+    Stop an EC2 instance by ID, but ONLY if it was created by this CLI.
+
+    POSITIONAL:
+      INSTANCE_ID   e.g., i-0123456789abcdef0
+    """
+    if examples:
         click.echo(
-            f"[DRY-RUN]   Tags=CreatedBy={DEFAULT_TAGS['CreatedBy']}, "
-            f"Owner={owner}, Project={project}, Environment={env}"
+            "Examples:\n"
+            "  project-cli ec2 stop i-0123456789abcdef0 --region us-east-1\n"
+            "  project-cli ec2 stop i-0abc... --force\n"
         )
         return
 
-    click.echo(f"Instance created: {result['InstanceId']} (ImageId={result['ImageId']})")
+    if not instance_id:
+        click.echo("ERROR: Missing required INSTANCE_ID.\nTry 'project-cli ec2 stop -h' for help.", err=True)
+        raise SystemExit(2)
+
+    try:
+        session = _session_from(profile)
+    except ProfileNotFound:
+        click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    effective_region = _effective_region(session, region)
+    client = session.client("ec2", region_name=effective_region)
+
+    try:
+        desc = client.describe_instances(InstanceIds=[instance_id])
+        all_tags = {t["Key"]: t["Value"]
+                    for r in desc.get("Reservations", [])
+                    for i in r.get("Instances", [])
+                    for t in i.get("Tags", [])}
+        if all_tags.get("CreatedBy") != DEFAULT_TAGS["CreatedBy"]:
+            click.echo("ERROR: Instance is not tagged CreatedBy=project-cli. Refusing to stop.", err=True)
+            raise SystemExit(2)
+
+        client.stop_instances(InstanceIds=[instance_id], Force=bool(force))
+        click.echo(f"Stop initiated for {instance_id} (region={effective_region}, force={bool(force)})")
+
+    except NoCredentialsError:
+        click.echo("ERROR: No AWS credentials. Run `aws configure` or use --profile.", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except ClientError as e:
+        click.echo(f"AWS error (stop_instances): {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except Exception as e:
+        click.echo(f"Unexpected error: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
