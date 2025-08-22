@@ -126,7 +126,7 @@ def _run_instance(
     effective_region = _effective_region(session, region)
     client = session.client("ec2", region_name=effective_region)
 
-    tags = build_tag_list(owner=owner, project=project, environment=env)
+    tags = build_tag_list(owner, project, env)
     name_value = f"{owner}-{(project or 'cli')}-{instance_type}"
     tags.append({"Key": "Name", "Value": name_value})
 
@@ -225,9 +225,13 @@ def list_instances(profile, region, owner, debug):
 def create_instance(os, instance_type, examples, profile, region, owner, project, env, key_name, key_type, save_key_to, debug):
     """
     Create an EC2 instance with safeguards:
+
     - Only t3.micro or t2.small
+
     - Hard cap: <= 2 running instances created by this CLI
+
     - Latest AMI via SSM (Ubuntu or Amazon Linux 2)
+
     - Optional --key: use existing key or auto-create & save locally
     """
     if examples:
