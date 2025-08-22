@@ -71,8 +71,8 @@ pip install -e .
 # Verify installation
 project-cli --help
 
-# Set up AWS credentials
-aws configure (assuming AWS CLI is installed)
+# Set up AWS credentials (requires AWS CLI installed)
+aws configure
 ```
 ---
 ## 🛠️ Usage
@@ -157,7 +157,7 @@ project-cli route53 delete-record Z123456ABCDEFG --type A --name test.example.co
 ---
 
 ## ⚠️ Caution
-- This tool **only manages resources it created** (tagged with `CreatedBy = project cli`). It will not affect other resources in your AWS account.
+- This tool **only manages resources it created** (tagged with `CreatedBy = project-cli`). It will not affect other resources in your AWS account.
 - Always review commands before executing, especially delete/terminate operations.
 - Ensure you have the necessary permissions in your AWS IAM policy to create, list, and delete the resources managed by this CLI.
 
