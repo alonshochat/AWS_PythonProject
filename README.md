@@ -43,7 +43,7 @@ The enforced tagging ensures:
 
 ## 🛠️ Requirements
 
-- **Python 3.12+** installed on your system
+- **Python 3.12+** and **Git** installed on your system
 - AWS CLI installed (for `aws configure`)
 - **AWS account** with valid credentials
   - Configure with `aws configure` or by using AWS profiles (`~/.aws/credentials`)
@@ -52,7 +52,7 @@ The enforced tagging ensures:
   - `click` – for building the CLI
   - `botocore` – low-level AWS service definitions
 - (Optional) **Virtual environment** recommended:
-  ```bash
+  ```
   python -m venv venv
   source venv/bin/activate   # Linux / Mac
   venv\Scripts\activate      # Windows
@@ -64,16 +64,21 @@ The enforced tagging ensures:
 Clone the repo and install in **editable mode**:
 
 ```
+# clone repo:
 git clone https://github.com/alonshochat/AWS_PythonProject.git
 cd AWS_PythonProject-master
+
+# install dependencies and the CLI:
 pip install -e .
+
+# install extra tools for development (tests, formatters, etc.):
+pip install -r package_requirements.txt
 
 # Verify installation
 project-cli --help
 
-# Set up AWS credentials (requires AWS CLI installed)
+# Set up AWS credentials (requires AWS CLI installed):
 aws configure
-```
 ---
 ## 🛠️ Usage
 
