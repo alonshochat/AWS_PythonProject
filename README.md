@@ -39,6 +39,9 @@ The enforced tagging ensures:
 - **Create**, **update**, and **delete** DNS records (A, CNAME, TXT, etc.)
 - Safe operations — only tagged records are managed
 
+### Global Status Command
+- `project-cli status` – shows a summary of all resources created by this CLI across all services and regions.
+
 ---
 
 ## 🛠️ Requirements
