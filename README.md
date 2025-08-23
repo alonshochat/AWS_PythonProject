@@ -82,7 +82,11 @@ project-cli --help
 
 # Set up AWS credentials (requires AWS CLI installed):
 aws configure
+
+```
+
 ---
+
 ## 🛠️ Usage
 
 ### After installation, you can use the CLI as follows (Examples):
