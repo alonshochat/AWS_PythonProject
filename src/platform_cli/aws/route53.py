@@ -64,13 +64,11 @@ def list_zones(profile, owner, debug):
         raise SystemExit(2)
 
     try:
-        # List hosted zones, then filter by tags
         paginator = client.get_paginator("list_hosted_zones")
         found_any = False
         for page in paginator.paginate():
             for hz in page.get("HostedZones", []):
                 zone_id = hz["Id"].split("/")[-1]
-                # Fetch tags and filter
                 try:
                     t = client.list_tags_for_resource(ResourceType="hostedzone", ResourceId=zone_id)
                     tags = {x["Key"]: x["Value"] for x in t.get("ResourceTagSet", {}).get("Tags", [])}
@@ -103,7 +101,6 @@ def list_zones(profile, owner, debug):
 
 
 @route53.command("create-zone", context_settings=dict(help_option_names=["-h", "--help"]))
-# put --examples BEFORE positionals so it can short-circuit without args
 @click.option("--examples", is_flag=True, help="Show usage examples and exit")
 @click.argument("name", required=False)  # DNS name (e.g., example.com)
 @click.option("--profile", default=None, help="AWS profile")
@@ -150,7 +147,6 @@ def create_zone(examples, name, profile, owner, project, env, comment, debug):
             traceback.print_exc()
         raise SystemExit(2)
 
-    # Tag the zone
     try:
         client.change_tags_for_resource(
             ResourceType="hostedzone",
@@ -164,7 +160,6 @@ def create_zone(examples, name, profile, owner, project, env, comment, debug):
 
 
 @route53.command("create-record", context_settings=dict(help_option_names=["-h", "--help"]))
-# --examples FIRST so it can run without args
 @click.option("--examples", is_flag=True, help="Show usage examples and exit")
 @click.argument("zone_id", required=False)
 @click.argument("name", required=False)
@@ -195,16 +190,13 @@ def create_record(examples, zone_id, name, rtype, value, ttl, profile, debug):
         click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
         raise SystemExit(2)
 
-    # Validate zone ownership
     if not _zone_is_cli_owned(client, zone_id):
         click.echo("Refusing to modify records: zone is not tagged CreatedBy=project-cli.", err=True)
         raise SystemExit(2)
 
-    # Normalize
     record_name = name if name.endswith(".") else name + "."
     rtype = rtype.upper()
     if rtype == "TXT":
-        # Ensure TXT values are quoted
         record_value = json.dumps(value) if not (value.startswith('"') and value.endswith('"')) else value
     else:
         record_value = value
@@ -242,10 +234,6 @@ def create_record(examples, zone_id, name, rtype, value, ttl, profile, debug):
         raise SystemExit(2)
 
 
-# -----------------------------
-# New commands to complete exam requirements
-# -----------------------------
-
 @route53.command("list-records", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--examples", is_flag=True, help="Show usage examples and exit")
 @click.argument("zone_id", required=False)
@@ -271,7 +259,6 @@ def list_records(examples, zone_id, profile, debug):
         click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
         raise SystemExit(2)
 
-    # Ensure zone is ours
     if not _zone_is_cli_owned(client, zone_id):
         click.echo("Refusing to list records: zone is not tagged CreatedBy=project-cli.", err=True)
         raise SystemExit(2)
@@ -431,6 +418,58 @@ def delete_record(examples, zone_id, name, rtype, value, ttl, profile, yes, debu
         click.echo(f"Record delete requested: {record_name} {rtype} change={change_id}")
     except (NoCredentialsError, ClientError) as e:
         click.echo(f"AWS error (change_resource_record_sets): {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except Exception as e:
+        click.echo(f"Unexpected error: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+
+@route53.command("delete-zone", context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option("--examples", is_flag=True, help="Show usage examples and exit")
+@click.argument("zone_id", required=False)
+@click.option("--profile", default=None, help="AWS profile")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+@click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
+def delete_zone(examples, zone_id, profile, yes, debug):
+    """
+    Delete a hosted zone (only if created by this CLI).
+    Will refuse if the zone has non-default records.
+    """
+    if examples:
+        click.echo(
+            "Examples:\n"
+            "  project-cli route53 delete-zone Z123ABCDEF\n"
+            "  project-cli route53 delete-zone Z123ABCDEF --yes --profile myprofile\n"
+        )
+        return
+
+    if not zone_id:
+        click.echo("ERROR: Missing ZONE_ID.\nTry 'project-cli route53 delete-zone -h' for help.", err=True)
+        raise SystemExit(2)
+
+    try:
+        session = _session_from(profile)
+        client = _r53_client(session)
+    except ProfileNotFound:
+        click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
+        raise SystemExit(2)
+
+    if not _zone_is_cli_owned(client, zone_id):
+        click.echo("Refusing to delete: zone is not tagged CreatedBy=project-cli.", err=True)
+        raise SystemExit(2)
+
+    if not yes:
+        click.confirm(f"About to DELETE hosted zone {zone_id}. Continue?", abort=True)
+
+    try:
+        client.delete_hosted_zone(Id=zone_id)
+        click.echo(f"Hosted zone deleted: {zone_id}")
+    except ClientError as e:
+        click.echo(f"AWS error (delete_hosted_zone): {e}", err=True)
         if debug:
             traceback.print_exc()
         raise SystemExit(2)

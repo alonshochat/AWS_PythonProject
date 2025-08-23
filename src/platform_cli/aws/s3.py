@@ -35,7 +35,6 @@ def _session_from(profile: Optional[str]):
 
 
 def _effective_region(session: boto3.Session, region: Optional[str]) -> str:
-    # Prefer CLI option, then profile default, then sane default
     return region or session.region_name or "us-east-1"
 
 
@@ -49,6 +48,18 @@ def _bucket_has_cli_tag(client, bucket_name: str) -> bool:
         return False
 
 
+def _format_size(num_bytes: int) -> str:
+    """Convert size in bytes to human-readable string."""
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    elif num_bytes < 1024 ** 2:
+        return f"{num_bytes/1024:.1f} KB"
+    elif num_bytes < 1024 ** 3:
+        return f"{num_bytes/1024**2:.1f} MB"
+    else:
+        return f"{num_bytes/1024**3:.1f} GB"
+
+
 # -----------------------------
 # Commands
 # -----------------------------
@@ -58,7 +69,7 @@ def _bucket_has_cli_tag(client, bucket_name: str) -> bool:
 @click.option("--owner", default=None, help="Filter by Owner tag (optional)")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
 def list_buckets(profile, owner, debug):
-    """List S3 buckets created by this CLI (tagged CreatedBy=project-cli)."""
+    """List S3 buckets created by this CLI (tagged CreatedBy=project-cli). Shows object count + size."""
     try:
         session = _session_from(profile)
     except ProfileNotFound:
@@ -83,8 +94,19 @@ def list_buckets(profile, owner, debug):
             if owner and tags.get("Owner") != owner:
                 continue
 
+            # Count objects and total size
+            count, total_size = 0, 0
+            try:
+                paginator = s3c.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=name):
+                    for obj in page.get("Contents", []):
+                        count += 1
+                        total_size += obj.get("Size", 0)
+            except ClientError:
+                pass  # ignore if bucket inaccessible
+
             found = True
-            click.echo(name)
+            click.echo(f"{name}\tobjects={count}\tsize={_format_size(total_size)}")
 
         if not found:
             click.echo("No buckets found (CreatedBy=project-cli).")
@@ -108,10 +130,9 @@ def list_buckets(profile, owner, debug):
 
 
 @s3.command("create", context_settings=dict(help_option_names=["-h", "--help"]))
-# put --examples BEFORE arguments so it can short-circuit without NAME
 @click.option("--examples", is_flag=True, help="Show usage examples and exit")
-@click.argument("name", required=False)                       # bucket name positional
-@click.argument("visibility", required=False)                 # 'private' (default) or 'public'
+@click.argument("name", required=False)
+@click.argument("visibility", required=False)
 @click.option("--profile", default=None, help="AWS profile")
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
 @click.option("--owner", default=getpass.getuser(), show_default=True, help="Owner tag value")
@@ -122,20 +143,14 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
     """
     Create an S3 bucket with safe defaults and tagging.
 
-    You must choose visibility: PRIVATE (default) or PUBLIC (prompted).
-    PRIVATE = fully blocked public access + default SSE-S3 encryption.
-    PUBLIC  = disables public access block and attaches a public-read bucket policy.
-
-    Arguments:
-      NAME        bucket name
-      VISIBILITY  private|public  (optional, defaults to private)
+    You must choose visibility: PRIVATE or PUBLIC.
     """
     if examples:
         click.echo(
             "Examples:\n"
             "  project-cli s3 create my-unique-bucket-123 private --region us-east-1\n"
             "  project-cli s3 create public-static-site-bkt public --region us-east-1\n"
-            "  project-cli s3 create course-demo-bucket        # defaults to private\n"
+            "  project-cli s3 create my-bucket          # will prompt for visibility\n"
         )
         return
 
@@ -143,15 +158,16 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
         click.echo("ERROR: Missing required NAME argument.\nTry 'project-cli s3 create -h' for help.", err=True)
         raise SystemExit(2)
 
-    vis = (visibility or "private").lower()
+    vis = visibility.lower() if visibility else None
+    if not vis:
+        vis = click.prompt("Visibility (private/public)", type=click.Choice(["private", "public"], case_sensitive=False))
+
     if vis not in ("private", "public"):
-        click.echo("ERROR: visibility must be 'private' or 'public' (or omit for private).", err=True)
+        click.echo("ERROR: visibility must be 'private' or 'public'.", err=True)
         raise SystemExit(2)
+
     if vis == "public":
-        click.confirm(
-            "This will make the bucket PUBLIC (readable by everyone). Continue?",
-            abort=True
-        )
+        click.confirm("This will make the bucket PUBLIC (readable by everyone). Continue?", abort=True)
 
     try:
         session = _session_from(profile)
@@ -164,7 +180,6 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
     effective_region = _effective_region(session, region)
     client = session.client("s3", region_name=effective_region)
 
-    # Create bucket (special-case for us-east-1 with no LocationConstraint)
     create_kwargs: Dict[str, object] = {"Bucket": name}
     if effective_region != "us-east-1":
         create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": effective_region}
@@ -177,7 +192,6 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
             traceback.print_exc()
         raise SystemExit(2)
 
-    # Default encryption (SSE-S3) for both modes
     try:
         client.put_bucket_encryption(
             Bucket=name,
@@ -188,7 +202,6 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
     except ClientError as e:
         click.echo(f"WARNING: bucket created but default encryption failed: {e}", err=True)
 
-    # Tag bucket
     try:
         client.put_bucket_tagging(
             Bucket=name,
@@ -197,9 +210,7 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
     except ClientError as e:
         click.echo(f"WARNING: bucket created but tagging failed: {e}", err=True)
 
-    # Visibility config
     if vis == "private":
-        # Block public access
         try:
             client.put_public_access_block(
                 Bucket=name,
@@ -212,11 +223,8 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
             )
         except ClientError as e:
             click.echo(f"WARNING: failed to apply public access block: {e}", err=True)
-
         click.echo(f"Bucket created (PRIVATE) and tagged: {name} (region={effective_region})")
-
-    else:  # public
-        # Disable public access block and attach a read-only policy
+    else:
         try:
             client.put_public_access_block(
                 Bucket=name,
@@ -246,7 +254,6 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
             client.put_bucket_policy(Bucket=name, Policy=json.dumps(policy))
         except ClientError as e:
             click.echo(f"WARNING: failed to attach public-read policy: {e}", err=True)
-
         click.echo(f"Bucket created (PUBLIC) and tagged: {name} (region={effective_region})")
 
 
@@ -259,11 +266,7 @@ def create_bucket(examples, name, visibility, profile, region, owner, project, e
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
 def upload_object(examples, bucket, filepath, key, profile, region, debug):
-    """
-    Upload a local FILE to S3 BUCKET at KEY (defaults to the filename if omitted).
-
-    Only allowed for buckets created by this CLI (tag CreatedBy=project-cli).
-    """
+    """Upload a local FILE to S3 BUCKET at KEY."""
     if examples:
         click.echo(
             "Examples:\n"
@@ -272,7 +275,6 @@ def upload_object(examples, bucket, filepath, key, profile, region, debug):
         )
         return
 
-    # Argument checks (so --examples can be called without args)
     if not bucket or not filepath:
         click.echo("ERROR: Missing required arguments BUCKET and FILE.\nTry 'project-cli s3 upload -h' for help.", err=True)
         raise SystemExit(2)
@@ -290,14 +292,12 @@ def upload_object(examples, bucket, filepath, key, profile, region, debug):
 
     if not _bucket_has_cli_tag(client, bucket):
         click.echo(
-            f"ERROR: Bucket '{bucket}' is not tagged CreatedBy={DEFAULT_TAGS['CreatedBy']}. "
-            "Upload is refused.",
+            f"ERROR: Bucket '{bucket}' is not tagged CreatedBy={DEFAULT_TAGS['CreatedBy']}. Upload refused.",
             err=True,
         )
         raise SystemExit(2)
 
     object_key = key or os.path.basename(filepath)
-
     extra_args: Dict[str, str] = {}
     ctype, _ = mimetypes.guess_type(object_key)
     if ctype:
@@ -326,21 +326,78 @@ def upload_object(examples, bucket, filepath, key, profile, region, debug):
         raise SystemExit(2)
 
 
+@s3.command("empty", context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option("--examples", is_flag=True, help="Show usage examples and exit")
+@click.argument("bucket", required=False)
+@click.option("--profile", default=None, help="AWS profile")
+@click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+@click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
+def empty_bucket(examples, bucket, profile, region, yes, debug):
+    """Empty an S3 bucket (delete all objects/versions) but keep the bucket."""
+    if examples:
+        click.echo(
+            "Examples:\n"
+            "  project-cli s3 empty my-bucket --region us-east-1\n"
+            "  project-cli s3 empty my-bucket --yes\n"
+        )
+        return
+
+    if not bucket:
+        click.echo("ERROR: Missing required BUCKET.\nTry 'project-cli s3 empty -h' for help.", err=True)
+        raise SystemExit(2)
+
+    try:
+        session = _session_from(profile)
+    except ProfileNotFound:
+        click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    effective_region = _effective_region(session, region)
+    s3c = session.client("s3", region_name=effective_region)
+    s3r = session.resource("s3", region_name=effective_region)
+
+    if not _bucket_has_cli_tag(s3c, bucket):
+        click.echo(
+            f"Refusing to empty '{bucket}': not tagged CreatedBy={DEFAULT_TAGS['CreatedBy']}.",
+            err=True
+        )
+        raise SystemExit(2)
+
+    if not yes:
+        click.confirm(f"This will DELETE ALL objects (and versions) in '{bucket}'. Continue?", abort=True)
+
+    try:
+        b = s3r.Bucket(bucket)
+        deleted = 0
+        try:
+            for obj in b.object_versions.all():
+                obj.delete()
+                deleted += 1
+        except Exception:
+            for obj in b.objects.all():
+                obj.delete()
+                deleted += 1
+        click.echo(f"Emptied bucket '{bucket}' ({deleted} object(s)/version(s) deleted).")
+    except ClientError as e:
+        click.echo(f"AWS error while emptying bucket: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+
 @s3.command("delete", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--examples", is_flag=True, help="Show usage examples and exit")
 @click.argument("bucket", required=False)
 @click.option("--profile", default=None, help="AWS profile")
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
-@click.option("--force", is_flag=True, help="Permanently delete all objects (and versions) before removing the bucket")
+@click.option("--force", is_flag=True, help="Delete all objects (and versions) before removing bucket")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
 def delete_bucket(examples, bucket, profile, region, force, yes, debug):
-    """
-    Delete an S3 bucket created by this CLI (tagged CreatedBy=project-cli).
-
-    By default the bucket must be EMPTY. Use --force to delete ALL objects and
-    object versions first. This action is irreversible.
-    """
+    """Delete an S3 bucket created by this CLI."""
     if examples:
         click.echo(
             "Examples:\n"
@@ -366,7 +423,6 @@ def delete_bucket(examples, bucket, profile, region, force, yes, debug):
     s3c = session.client("s3", region_name=effective_region)
     s3r = session.resource("s3", region_name=effective_region)
 
-    # Ensure it's a CLI bucket
     if not _bucket_has_cli_tag(s3c, bucket):
         click.echo(
             f"Refusing to delete '{bucket}': not tagged CreatedBy={DEFAULT_TAGS['CreatedBy']}.",
@@ -374,18 +430,15 @@ def delete_bucket(examples, bucket, profile, region, force, yes, debug):
         )
         raise SystemExit(2)
 
-    # Confirm
     if not yes:
         msg = "This will DELETE the bucket"
         msg += " and ALL contents (versions!)" if force else " (must be empty)"
         msg += f": {bucket}. Continue?"
         click.confirm(msg, abort=True)
 
-    # If --force, purge objects/versions
     if force:
         try:
             b = s3r.Bucket(bucket)
-            # Attempt to delete versions; if versioning off, fallback to objects
             try:
                 b.object_versions.delete()
             except Exception:
@@ -396,7 +449,6 @@ def delete_bucket(examples, bucket, profile, region, force, yes, debug):
                 traceback.print_exc()
             raise SystemExit(2)
 
-    # Attempt bucket delete
     try:
         s3c.delete_bucket(Bucket=bucket)
         click.echo(f"Bucket deleted: {bucket} (region={effective_region})")

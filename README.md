@@ -29,9 +29,9 @@ The enforced tagging ensures:
 ### S3
 - **Create** buckets (tagged + unique name validation)
 - **Upload** files
-- **Download** files
+- **Empty** files from buckets
 - **List** buckets and contents
-- **Delete** objects and buckets (safe, tag-scoped)
+- **Delete** buckets (safe, tag-scoped)
 
 ### Route53
 - **List** hosted zones
@@ -85,21 +85,23 @@ aws configure
 ```
 project-cli ec2 create ubuntu t3.micro --region us-east-1
 project-cli ec2 list 
-project-cli ec2 terminate i-0123456789abcdef0 (id from list)
+project-cli ec2 terminate i-0123456789abcdef0 (id or name from list)
 ```
 
 ### S3
 ```
 project-cli s3 create my-bucket --region us-east-1
 project-cli s3 upload my-bucket ./file.txt
-project-cli s3 download my-bucket file.txt ./downloaded.txt
+project-cli s3 empty my-bucket 
+project-cli s3 delete my-bucket
 ```
 
 ### Route53
 ```
-project-cli route53 zones
-project-cli route53 records Z123456ABCDEFG
+project-cli route53 list-zones
+project-cli route53 list-records Z123456ABCDEFG
 project-cli route53 create-record Z123456ABCDEFG --type A --name test.example.com --value 1.2.3.4 --ttl 300
+project-cli route53 delete-record Z123456ABCDEFG --type A --name test.example.com --value
 ```
 
 ---

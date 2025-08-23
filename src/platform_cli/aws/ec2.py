@@ -1,10 +1,12 @@
 # src/platform_cli/aws/ec2.py
 
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import getpass
 import traceback
 import os
+import sys
 import stat
+import re
 
 import click
 import boto3
@@ -19,6 +21,7 @@ from botocore.exceptions import (
 from platform_cli.config import DEFAULT_TAGS, build_tag_list
 
 ALLOWED_INSTANCE_TYPES = {"t3.micro", "t2.small"}
+_ID_RE = re.compile(r"^i-[a-f0-9]{8,}$", re.IGNORECASE)
 
 
 @click.group()
@@ -112,6 +115,24 @@ def _safe_write_pem(filepath: str, key_material: str):
         pass  # best effort on non-POSIX
 
 
+def _resolve_instance_name(default_name: str, provided_name: Optional[str], no_prompt: bool) -> str:
+    """
+    Decide final instance Name:
+      - if provided_name is given, use it
+      - else if no_prompt or stdin not a tty, use default_name
+      - else prompt once with default shown
+    """
+    if provided_name:
+        return provided_name.strip()
+    try:
+        if no_prompt or not sys.stdin.isatty():
+            return default_name
+        value = click.prompt("Instance name", default=default_name, show_default=True)
+        return (value or default_name).strip()
+    except Exception:
+        return default_name
+
+
 def _run_instance(
     session: boto3.Session,
     region: Optional[str],
@@ -121,13 +142,15 @@ def _run_instance(
     project: Optional[str],
     env: Optional[str],
     key_name: Optional[str] = None,
+    *,
+    resolved_name: Optional[str] = None,
 ) -> Dict[str, str]:
     """Run a single instance with tags + Name (and optional KeyName)."""
     effective_region = _effective_region(session, region)
     client = session.client("ec2", region_name=effective_region)
 
     tags = build_tag_list(owner, project, env)
-    name_value = f"{owner}-{(project or 'cli')}-{instance_type}"
+    name_value = resolved_name or f"{owner}-{(project or 'cli')}-{instance_type}"
     tags.append({"Key": "Name", "Value": name_value})
 
     run_args = dict(
@@ -143,6 +166,64 @@ def _run_instance(
     resp = client.run_instances(**run_args)
     inst = resp["Instances"][0]
     return {"InstanceId": inst["InstanceId"], "ImageId": ami_id, "Name": name_value}
+
+
+# -----------------------------
+# ID/Name resolution utilities
+# -----------------------------
+
+def _resolve_name_to_ids(session: boto3.Session, region: Optional[str], name: str) -> List[str]:
+    """Resolve a Name tag to instance IDs (scoped to CreatedBy=project-cli)."""
+    effective_region = _effective_region(session, region)
+    ec2c = session.client("ec2", region_name=effective_region)
+    filters = [
+        {"Name": "tag:CreatedBy", "Values": ["project-cli"]},
+        {"Name": "tag:Name", "Values": [name]},
+    ]
+    resp = ec2c.describe_instances(Filters=filters)
+    ids: List[str] = []
+    for r in resp.get("Reservations", []):
+        for i in r.get("Instances", []):
+            ids.append(i["InstanceId"])
+    return ids
+
+
+def _resolve_tokens_to_instance_ids(session: boto3.Session, region: Optional[str], tokens: List[str]) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
+    """
+    Accept a mixed list of tokens (instance IDs or Name tag values) and return:
+      - resolved_ids: List[str]
+      - not_found_names: List[str]
+      - name_map: Dict[str, List[str]]  (name -> ids matched)
+    All lookups are scoped to CreatedBy=project-cli.
+    """
+    ids: List[str] = []
+    names: List[str] = []
+    for t in tokens:
+        if _ID_RE.match(t):
+            ids.append(t)
+        else:
+            names.append(t)
+
+    name_map: Dict[str, List[str]] = {}
+    not_found: List[str] = []
+
+    for nm in names:
+        matched_ids = _resolve_name_to_ids(session, region, nm)
+        if matched_ids:
+            name_map[nm] = matched_ids
+            ids.extend(matched_ids)
+        else:
+            not_found.append(nm)
+
+    # De-dupe while preserving order
+    seen = set()
+    resolved_ids: List[str] = []
+    for iid in ids:
+        if iid not in seen:
+            resolved_ids.append(iid)
+            seen.add(iid)
+
+    return resolved_ids, not_found, name_map
 
 
 # -----------------------------
@@ -221,8 +302,11 @@ def list_instances(profile, region, owner, debug):
 @click.option("--key", "key_name", default=None, help="EC2 key pair name to use; if missing, it will be created and saved locally")
 @click.option("--key-type", type=click.Choice(["ed25519", "rsa"], case_sensitive=False), default="ed25519", show_default=True, help="Key type when creating a new key pair")
 @click.option("--save-key-to", default=None, help="Where to save a newly created private key (default: ~/.ssh/<key>.pem)")
+# NEW name/interaction options:
+@click.option("--name", default=None, help="Instance Name tag; if omitted, you will be prompted with a default.")
+@click.option("--no-prompt", is_flag=True, help="Disable interactive prompts (CI-safe); use defaults.")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on error")
-def create_instance(os, instance_type, examples, profile, region, owner, project, env, key_name, key_type, save_key_to, debug):
+def create_instance(os, instance_type, examples, profile, region, owner, project, env, key_name, key_type, save_key_to, name, no_prompt, debug):
     """
     Create an EC2 instance with safeguards:
 
@@ -233,6 +317,8 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
     - Latest AMI via SSM (Ubuntu or Amazon Linux 2)
 
     - Optional --key: use existing key or auto-create & save locally
+
+    - Interactive name prompt with default unless --name/--no-prompt provided
     """
     if examples:
         click.echo(
@@ -240,8 +326,10 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
             "  project-cli ec2 create amazon-linux t3.micro --region us-east-1\n"
             "  project-cli ec2 create ubuntu t2.small --owner alice --project demo --env dev\n"
             "  project-cli ec2 create ubuntu t3.micro --profile myprofile\n"
-            "  project-cli ec2 create ubuntu t3.micro --key my-dev-key --region us-east-1\n"
+            "  project-cli ec2 create amazon-linux t3.micro --key my-dev-key --region us-east-1\n"
             "  project-cli ec2 create ubuntu t3.micro --key my-rsa --key-type rsa --save-key-to ~/.ssh/my-rsa.pem\n"
+            "  project-cli ec2 create amazon-linux t2.small --name my-api           # skip prompt with explicit name\n"
+            "  project-cli ec2 create ubuntu t3.micro --no-prompt              # CI-safe; uses default name\n"
         )
         return
 
@@ -334,6 +422,10 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
                     traceback.print_exc()
                 raise SystemExit(2)
 
+    # Resolve final Name (prompt/default/explicit)
+    default_name = f"{owner}-{(project or 'cli')}-{instance_type}"
+    final_name = _resolve_instance_name(default_name, name, no_prompt)
+
     # Run instance
     try:
         result = _run_instance(
@@ -345,6 +437,7 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
             project=project,
             env=env,
             key_name=key_to_use,
+            resolved_name=final_name,
         )
         click.echo(
             f"Created {result['InstanceId']} ({instance_type}) "
@@ -380,26 +473,27 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
 
 
 # --- start/stop/terminate (restrict) ---
+
 @ec2.command("start", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--examples", is_flag=True, help="Show usage examples")
-@click.argument("instance_id", required=False)
+@click.argument("instance", required=False)  # ID or Name
 @click.option("--profile", default=None, help="AWS profile to use (falls back to AWS_PROFILE)")
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
-def start_instance(examples, instance_id, profile, region, debug):
+def start_instance(examples, instance, profile, region, debug):
     """
-    Start an EC2 instance (only if tagged CreatedBy=project-cli).
+    Start an EC2 instance (ID or Name, but only if tagged CreatedBy=project-cli).
     """
     if examples:
         click.echo(
             "Examples:\n"
             "  project-cli ec2 start i-0123456789abcdef0 --region us-east-1\n"
-            "  project-cli ec2 start i-0abc... --profile myprofile\n"
+            "  project-cli ec2 start my-api --profile myprofile                # by Name tag\n"
         )
         return
 
-    if not instance_id:
-        click.echo("Missing required argument INSTANCE_ID.\nTry 'project-cli ec2 start -h' for help.", err=True)
+    if not instance:
+        click.echo("Missing required argument INSTANCE (ID or Name).\nTry 'project-cli ec2 start -h' for help.", err=True)
         raise SystemExit(2)
 
     try:
@@ -411,9 +505,25 @@ def start_instance(examples, instance_id, profile, region, debug):
     effective_region = _effective_region(session, region)
     client = session.client("ec2", region_name=effective_region)
 
+    # Resolve to exactly one ID
+    if _ID_RE.match(instance):
+        target_ids = [instance]
+        note = ""
+    else:
+        ids = _resolve_name_to_ids(session, region, instance)
+        if not ids:
+            click.echo(f"No instances found with Name='{instance}' (CreatedBy=project-cli).", err=True)
+            raise SystemExit(2)
+        if len(ids) > 1:
+            click.echo(f"Name '{instance}' matched multiple instances: {' '.join(ids)}", err=True)
+            click.echo("Please specify an exact instance ID.", err=True)
+            raise SystemExit(2)
+        target_ids = ids
+        note = f" (resolved from Name='{instance}')"
+
     # Validate tag CreatedBy=project-cli
     try:
-        resp = client.describe_instances(InstanceIds=[instance_id])
+        resp = client.describe_instances(InstanceIds=target_ids)
         inst = resp["Reservations"][0]["Instances"][0]
         allowed = any(t["Key"] == "CreatedBy" and t["Value"] == "project-cli" for t in inst.get("Tags", []))
         if not allowed:
@@ -427,9 +537,8 @@ def start_instance(examples, instance_id, profile, region, debug):
 
     # Start
     try:
-        client.start_instances(InstanceIds=[instance_id])
-        click.echo(f"Start initiated for {instance_id} (region={effective_region})")
-
+        client.start_instances(InstanceIds=target_ids)
+        click.echo(f"Start initiated for {target_ids[0]}{note} (region={effective_region})")
     except NoCredentialsError:
         click.echo("ERROR: No AWS credentials. Configure with a profile or role.", err=True)
         raise SystemExit(2)
@@ -454,26 +563,26 @@ def start_instance(examples, instance_id, profile, region, debug):
 
 @ec2.command("stop", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--examples", is_flag=True, help="Show usage examples")
-@click.argument("instance_id", required=False)
+@click.argument("instance", required=False)  # ID or Name
 @click.option("--profile", default=None, help="AWS profile to use (falls back to AWS_PROFILE)")
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
 @click.option("--force", is_flag=True, help="Force stop (equivalent to hard power off)")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
-def stop_instance(examples, instance_id, profile, region, force, debug):
+def stop_instance(examples, instance, profile, region, force, debug):
     """
-    Stop an EC2 instance (only if tagged CreatedBy=project-cli).
+    Stop an EC2 instance (ID or Name, only if tagged CreatedBy=project-cli).
     """
     if examples:
         click.echo(
             "Examples:\n"
             "  project-cli ec2 stop i-0123456789abcdef0 --region us-east-1\n"
-            "  project-cli ec2 stop i-0abc... --profile myprofile\n"
+            "  project-cli ec2 stop my-api --profile myprofile                 # by Name tag\n"
             "  project-cli ec2 stop --force i-0123456789abcdef0\n"
         )
         return
 
-    if not instance_id:
-        click.echo("Missing required argument INSTANCE_ID.\nTry 'project-cli ec2 stop -h' for help.", err=True)
+    if not instance:
+        click.echo("Missing required argument INSTANCE (ID or Name).\nTry 'project-cli ec2 stop -h' for help.", err=True)
         raise SystemExit(2)
 
     try:
@@ -485,9 +594,25 @@ def stop_instance(examples, instance_id, profile, region, force, debug):
     effective_region = _effective_region(session, region)
     client = session.client("ec2", region_name=effective_region)
 
+    # Resolve to exactly one ID
+    if _ID_RE.match(instance):
+        target_ids = [instance]
+        note = ""
+    else:
+        ids = _resolve_name_to_ids(session, region, instance)
+        if not ids:
+            click.echo(f"No instances found with Name='{instance}' (CreatedBy=project-cli).", err=True)
+            raise SystemExit(2)
+        if len(ids) > 1:
+            click.echo(f"Name '{instance}' matched multiple instances: {' '.join(ids)}", err=True)
+            click.echo("Please specify an exact instance ID.", err=True)
+            raise SystemExit(2)
+        target_ids = ids
+        note = f" (resolved from Name='{instance}')"
+
     # Validate tag CreatedBy=project-cli
     try:
-        resp = client.describe_instances(InstanceIds=[instance_id])
+        resp = client.describe_instances(InstanceIds=target_ids)
         inst = resp["Reservations"][0]["Instances"][0]
         allowed = any(t["Key"] == "CreatedBy" and t["Value"] == "project-cli" for t in inst.get("Tags", []))
         if not allowed:
@@ -501,9 +626,8 @@ def stop_instance(examples, instance_id, profile, region, force, debug):
 
     # Stop
     try:
-        client.stop_instances(InstanceIds=[instance_id], Force=force)
-        click.echo(f"Stop initiated for {instance_id} (region={effective_region})")
-
+        client.stop_instances(InstanceIds=target_ids, Force=force)
+        click.echo(f"Stop initiated for {target_ids[0]}{note} (region={effective_region})")
     except NoCredentialsError:
         click.echo("ERROR: No AWS credentials. Configure with a profile or role.", err=True)
         raise SystemExit(2)
@@ -528,7 +652,7 @@ def stop_instance(examples, instance_id, profile, region, force, debug):
 
 @ec2.command("terminate", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--examples", is_flag=True, help="Show usage examples")
-@click.argument("instance_ids", nargs=-1, required=False)
+@click.argument("instance_ids", nargs=-1, required=False)  # IDs or Names (mixed)
 @click.option("--profile", default=None, help="AWS profile to use (falls back to AWS_PROFILE)")
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt")
@@ -536,18 +660,22 @@ def stop_instance(examples, instance_id, profile, region, force, debug):
 def terminate_instances(examples, instance_ids, profile, region, yes, debug):
     """
     Terminate one or more EC2 instances (only if tagged CreatedBy=project-cli).
+
+    Accepts either instance IDs (i-...) or Name tag values. Names are resolved
+    to IDs scoped to CreatedBy=project-cli.
     """
     if examples:
         click.echo(
             "Examples:\n"
             "  project-cli ec2 terminate i-0123456789abcdef0 --region us-east-1\n"
-            "  project-cli ec2 terminate i-0123 i-0456 --profile myprofile\n"
-            "  project-cli ec2 terminate --yes i-0abc...                       # no prompt\n"
+            "  project-cli ec2 terminate my-api --profile myprofile             # by Name tag\n"
+            "  project-cli ec2 terminate api-a api-b i-0abc...                   # mix names & IDs\n"
+            "  project-cli ec2 terminate --yes my-api                            # no prompt\n"
         )
         return
 
     if not instance_ids:
-        click.echo("Missing required argument(s) INSTANCE_ID...", err=True)
+        click.echo("Missing required argument(s) INSTANCE_ID_OR_NAME...", err=True)
         raise SystemExit(2)
 
     try:
@@ -559,10 +687,32 @@ def terminate_instances(examples, instance_ids, profile, region, yes, debug):
     effective_region = _effective_region(session, region)
     client = session.client("ec2", region_name=effective_region)
 
-    # Validate all IDs are allowed and tagged properly
+    # Resolve tokens (IDs or names) → IDs
+    try:
+        tokens = list(instance_ids)
+        resolved_ids, not_found_names, name_map = _resolve_tokens_to_instance_ids(session, region, tokens)
+    except ClientError as e:
+        click.echo(f"AWS error resolving names: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    if not resolved_ids:
+        if not_found_names:
+            click.echo("No instances resolved from provided names: " + ", ".join(not_found_names), err=True)
+        else:
+            click.echo("No valid instance IDs provided.", err=True)
+        raise SystemExit(2)
+
+    # Feedback on name resolution (non-fatal)
+    for nm, ids_for_nm in name_map.items():
+        if len(ids_for_nm) > 1:
+            click.echo(f"Note: name '{nm}' matched multiple instances: {' '.join(ids_for_nm)}")
+
+    # Validate all resolved IDs are allowed and tagged properly
     allowed_ids: List[str] = []
     try:
-        resp = client.describe_instances(InstanceIds=list(instance_ids))
+        resp = client.describe_instances(InstanceIds=resolved_ids)
         for r in resp.get("Reservations", []):
             for i in r.get("Instances", []):
                 iid = i["InstanceId"]
@@ -578,7 +728,7 @@ def terminate_instances(examples, instance_ids, profile, region, yes, debug):
         raise SystemExit(2)
 
     if not allowed_ids:
-        click.echo("No terminable instances among the provided IDs.", err=True)
+        click.echo("No terminable instances among the resolved IDs.", err=True)
         raise SystemExit(2)
 
     # Confirmation
