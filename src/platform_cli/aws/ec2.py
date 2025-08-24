@@ -18,7 +18,7 @@ from botocore.exceptions import (
     ParamValidationError,
 )
 
-from platform_cli.config import DEFAULT_TAGS, build_tag_list
+from platform_cli.config import build_tag_list
 
 ALLOWED_INSTANCE_TYPES = {"t3.micro", "t2.small"}
 _ID_RE = re.compile(r"^i-[a-f0-9]{8,}$", re.IGNORECASE)
@@ -131,6 +131,81 @@ def _resolve_instance_name(default_name: str, provided_name: Optional[str], no_p
         return (value or default_name).strip()
     except Exception:
         return default_name
+
+
+def _prompt_key_pair(
+    session: boto3.Session,
+    region: Optional[str],
+    owner: str,
+    project: Optional[str],
+    env: Optional[str],
+    no_prompt: bool,
+) -> Optional[str]:
+    """
+    Interactive key-pair resolver:
+      - if no_prompt or non-tty: return None (no KeyName)
+      - else prompt for a key name (blank for none)
+      - if name exists -> use it
+      - if not found -> ask to create; if yes, prompt for type + save path, create & tag, save PEM; return name
+    """
+    effective_region = _effective_region(session, region)
+    ec2c = session.client("ec2", region_name=effective_region)
+
+    # CI-safe / non-interactive -> no key
+    if no_prompt or not sys.stdin.isatty():
+        return None
+
+    try:
+        key_name = click.prompt("EC2 key pair name (leave blank for none)", default="", show_default=False).strip()
+    except Exception:
+        return None
+
+    if not key_name:
+        return None
+
+    # Exists?
+    try:
+        ec2c.describe_key_pairs(KeyNames=[key_name])
+        click.echo(f"Using existing key pair: {key_name} (region={effective_region})")
+        return key_name
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code != "InvalidKeyPair.NotFound":
+            raise
+
+    # Not found -> offer to create
+    if not click.confirm(f"Key pair '{key_name}' not found. Create it now?", default=True):
+        click.echo("Proceeding without a key pair.")
+        return None
+
+    # Choose type
+    key_type = click.prompt(
+        "Key type",
+        type=click.Choice(["ed25519", "rsa"], case_sensitive=False),
+        default="ed25519",
+        show_choices=True,
+        show_default=True,
+    ).lower()
+
+    save_default = os.path.expanduser(f"~/.ssh/{key_name}.pem")
+    save_path = click.prompt("Save private key PEM to", default=save_default, show_default=True)
+
+    try:
+        resp_kp = ec2c.create_key_pair(
+            KeyName=key_name,
+            KeyType=key_type,  # API expects 'ed25519' or 'rsa'
+            TagSpecifications=[{
+                "ResourceType": "key-pair",
+                "Tags": build_tag_list(owner, project, env),
+            }],
+        )
+        pem = resp_kp["KeyMaterial"]
+        _safe_write_pem(save_path, pem)
+        click.echo(f"Generated key pair '{key_name}' and saved PEM to {save_path}")
+        return key_name
+    except ClientError as ce:
+        click.echo(f"AWS error (create_key_pair): {ce}", err=True)
+        raise
 
 
 def _run_instance(
@@ -298,27 +373,19 @@ def list_instances(profile, region, owner, debug):
 @click.option("--owner", default=getpass.getuser(), show_default=True, help="Owner tag (defaults to current username)")
 @click.option("--project", default=None, help="Project tag (optional)")
 @click.option("--env", default=None, help="Environment tag (optional)")
-# NEW key options:
-@click.option("--key", "key_name", default=None, help="EC2 key pair name to use; if missing, it will be created and saved locally")
-@click.option("--key-type", type=click.Choice(["ed25519", "rsa"], case_sensitive=False), default="ed25519", show_default=True, help="Key type when creating a new key pair")
-@click.option("--save-key-to", default=None, help="Where to save a newly created private key (default: ~/.ssh/<key>.pem)")
-# NEW name/interaction options:
+# name / interaction options:
 @click.option("--name", default=None, help="Instance Name tag; if omitted, you will be prompted with a default.")
-@click.option("--no-prompt", is_flag=True, help="Disable interactive prompts (CI-safe); use defaults.")
+@click.option("--no-prompt", is_flag=True, help="Disable interactive prompts (CI-safe); use defaults (no key).")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on error")
-def create_instance(os, instance_type, examples, profile, region, owner, project, env, key_name, key_type, save_key_to, name, no_prompt, debug):
+def create_instance(os, instance_type, examples, profile, region, owner, project, env, name, no_prompt, debug):
     """
     Create an EC2 instance with safeguards:
 
     - Only t3.micro or t2.small
-
     - Hard cap: <= 2 running instances created by this CLI
-
     - Latest AMI via SSM (Ubuntu or Amazon Linux 2)
-
-    - Optional --key: use existing key or auto-create & save locally
-
-    - Interactive name prompt with default unless --name/--no-prompt provided
+    - Interactive Name prompt (default: owner-project-instanceType)
+    - Interactive Key Pair prompt (or none in --no-prompt mode)
     """
     if examples:
         click.echo(
@@ -326,10 +393,8 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
             "  project-cli ec2 create amazon-linux t3.micro --region us-east-1\n"
             "  project-cli ec2 create ubuntu t2.small --owner alice --project demo --env dev\n"
             "  project-cli ec2 create ubuntu t3.micro --profile myprofile\n"
-            "  project-cli ec2 create amazon-linux t3.micro --key my-dev-key --region us-east-1\n"
-            "  project-cli ec2 create ubuntu t3.micro --key my-rsa --key-type rsa --save-key-to ~/.ssh/my-rsa.pem\n"
-            "  project-cli ec2 create amazon-linux t2.small --name my-api           # skip prompt with explicit name\n"
-            "  project-cli ec2 create ubuntu t3.micro --no-prompt              # CI-safe; uses default name\n"
+            "  project-cli ec2 create amazon-linux t2.small --name my-api           # skip name prompt\n"
+            "  project-cli ec2 create ubuntu t3.micro --no-prompt              # CI-safe; uses default name, NO key\n"
         )
         return
 
@@ -383,48 +448,24 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
             traceback.print_exc()
         raise SystemExit(2)
 
-    # Prepare key pair if requested
-    key_to_use: Optional[str] = None
-    if key_name:
-        effective_region = _effective_region(session, region)
-        ec2c = session.client("ec2", region_name=effective_region)
-        try:
-            # Does the key already exist?
-            ec2c.describe_key_pairs(KeyNames=[key_name])
-            key_to_use = key_name
-            click.echo(f"Using existing key pair: {key_name} (region={effective_region})")
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            if code == "InvalidKeyPair.NotFound":
-                # Create it, tag it, save PEM
-                try:
-                    resp_kp = ec2c.create_key_pair(
-                        KeyName=key_name,
-                        KeyType=key_type.upper(),  # ED25519 or RSA
-                        TagSpecifications=[{
-                            "ResourceType": "key-pair",
-                            "Tags": build_tag_list(owner, project, env),
-                        }],
-                    )
-                    pem = resp_kp["KeyMaterial"]
-                    out_path = save_key_to or os.path.expanduser(f"~/.ssh/{key_name}.pem")
-                    _safe_write_pem(out_path, pem)
-                    click.echo(f"Generated key pair '{key_name}' and saved PEM to {out_path}")
-                    key_to_use = key_name
-                except ClientError as ce:
-                    click.echo(f"AWS error (create_key_pair): {ce}", err=True)
-                    if debug:
-                        traceback.print_exc()
-                    raise SystemExit(2)
-            else:
-                click.echo(f"AWS error (describe_key_pairs): {e}", err=True)
-                if debug:
-                    traceback.print_exc()
-                raise SystemExit(2)
-
     # Resolve final Name (prompt/default/explicit)
     default_name = f"{owner}-{(project or 'cli')}-{instance_type}"
     final_name = _resolve_instance_name(default_name, name, no_prompt)
+
+    # Interactive key-pair selection / create (or none in no-prompt)
+    key_to_use: Optional[str] = None
+    try:
+        key_to_use = _prompt_key_pair(session, region, owner, project, env, no_prompt)
+    except ClientError as e:
+        click.echo(f"AWS error during key pair handling: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+    except Exception as e:
+        click.echo(f"Key pair setup failed: {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
 
     # Run instance
     try:
@@ -442,7 +483,7 @@ def create_instance(os, instance_type, examples, profile, region, owner, project
         click.echo(
             f"Created {result['InstanceId']} ({instance_type}) "
             f"AMI={result['ImageId']} Name={result['Name']}"
-            + (f" KeyName={key_to_use}" if key_to_use else "")
+            + (f" KeyName={key_to_use}" if key_to_use else " (no key)")
         )
     except NoCredentialsError:
         click.echo("ERROR: No AWS credentials. Configure with a profile or role.", err=True)
@@ -761,27 +802,88 @@ def terminate_instances(examples, instance_ids, profile, region, yes, debug):
 
 @ec2.command("describe", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("--examples", is_flag=True, help="Show usage examples")
-@click.argument("instance_id", required=False)
+@click.argument("instance", required=False)  # ID or Name (ignored with --all)
+@click.option("--all", "show_all", is_flag=True, help="Show all instances created by you (Owner=<your user>).")
+@click.option("--owner", default=None, help="Owner tag to filter with --all (default: current username).")
 @click.option("--profile", default=None, help="AWS profile to use (falls back to AWS_PROFILE)")
 @click.option("--region", default=None, help="AWS region (e.g., us-east-1)")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
-def describe_instance(examples, instance_id, profile, region, debug):
+def describe_instance(examples, instance, show_all, owner, profile, region, debug):
     """
-    Show details for an EC2 instance created by this CLI:
-    - State, type, AZ, launch time
-    - Public/Private IP & DNS
-    - Name + all tags
+    Show details for EC2 instances created by this CLI.
+
+    Modes:
+      - Single instance by **ID or Name** (default)
+      - `--all` -> list all instances for the given Owner (default: current user)
     """
     if examples:
+        me = getpass.getuser()
         click.echo(
             "Examples:\n"
             "  project-cli ec2 describe i-0123456789abcdef0 --region us-east-1\n"
-            "  project-cli ec2 describe i-0abc... --profile myprofile\n"
+            "  project-cli ec2 describe my-api --profile myprofile              # by Name tag\n"
+            f"  project-cli ec2 describe --all                                   # Owner={me}\n"
+            "  project-cli ec2 describe --all --owner alice\n"
         )
         return
 
-    if not instance_id:
-        click.echo("Missing required argument INSTANCE_ID.\nTry 'project-cli ec2 describe -h' for help.", err=True)
+    # --all mode
+    if show_all:
+        if instance:
+            click.echo("ERROR: Do not pass INSTANCE together with --all.", err=True)
+            raise SystemExit(2)
+
+        try:
+            session = _session_from(profile)
+        except ProfileNotFound:
+            click.echo("ERROR: profile not found. Use --profile or set AWS_PROFILE.", err=True)
+            raise SystemExit(2)
+
+        effective_region = _effective_region(session, region)
+        client = session.client("ec2", region_name=effective_region)
+
+        owner_to_use = owner or getpass.getuser()
+        filters = [
+            {"Name": "tag:CreatedBy", "Values": ["project-cli"]},
+            {"Name": "tag:Owner", "Values": [owner_to_use]},
+        ]
+
+        try:
+            paginator = client.get_paginator("describe_instances")
+            pages = paginator.paginate(Filters=filters)
+
+            found = False
+            for page in pages:
+                for r in page.get("Reservations", []):
+                    for i in r.get("Instances", []):
+                        found = True
+                        iid   = i.get("InstanceId", "-")
+                        state = i.get("State", {}).get("Name", "-")
+                        itype = i.get("InstanceType", "-")
+                        az    = i.get("Placement", {}).get("AvailabilityZone", "-")
+                        name  = next((t["Value"] for t in i.get("Tags", []) if t.get("Key") == "Name"), "")
+                        click.echo(f"{iid}\t{state}\t{itype}\t{az}\t{name}")
+            if not found:
+                click.echo(f"No instances found for Owner={owner_to_use} (CreatedBy=project-cli).")
+
+        except (NoCredentialsError, EndpointConnectionError) as e:
+            click.echo(f"ERROR: {e}", err=True)
+            raise SystemExit(2)
+        except ClientError as e:
+            click.echo(f"AWS error (describe_instances): {e}", err=True)
+            if debug:
+                traceback.print_exc()
+            raise SystemExit(2)
+        except Exception as e:
+            click.echo(f"Unexpected error: {e}", err=True)
+            if debug:
+                traceback.print_exc()
+            raise SystemExit(2)
+        return
+
+    # Single instance mode (ID or Name)
+    if not instance:
+        click.echo("Missing required argument INSTANCE (ID or Name), or use --all.\nTry 'project-cli ec2 describe -h' for help.", err=True)
         raise SystemExit(2)
 
     try:
@@ -793,8 +895,24 @@ def describe_instance(examples, instance_id, profile, region, debug):
     effective_region = _effective_region(session, region)
     client = session.client("ec2", region_name=effective_region)
 
+    # Resolve to exactly one ID
+    if _ID_RE.match(instance):
+        target_ids = [instance]
+        note = ""
+    else:
+        ids = _resolve_name_to_ids(session, region, instance)
+        if not ids:
+            click.echo(f"No instances found with Name='{instance}' (CreatedBy=project-cli).", err=True)
+            raise SystemExit(2)
+        if len(ids) > 1:
+            click.echo(f"Name '{instance}' matched multiple instances: {' '.join(ids)}", err=True)
+            click.echo("Please specify an exact instance ID.", err=True)
+            raise SystemExit(2)
+        target_ids = ids
+        note = f" (resolved from Name='{instance}')"
+
     try:
-        resp = client.describe_instances(InstanceIds=[instance_id])
+        resp = client.describe_instances(InstanceIds=target_ids)
         inst = resp["Reservations"][0]["Instances"][0]
     except ClientError as e:
         click.echo(f"AWS error (describe_instances): {e}", err=True)
@@ -824,7 +942,7 @@ def describe_instance(examples, instance_id, profile, region, debug):
     pub_dns  = inst.get("PublicDnsName", "-")
     name_tag = next((t["Value"] for t in inst.get("Tags", []) if t.get("Key") == "Name"), "")
 
-    click.echo(f"InstanceId:   {iid}")
+    click.echo(f"InstanceId:   {iid}{note}")
     click.echo(f"State:        {state}")
     click.echo(f"Type:         {itype}")
     click.echo(f"AZ:           {az}")

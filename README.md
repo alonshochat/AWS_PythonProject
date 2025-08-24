@@ -20,11 +20,12 @@ The enforced tagging ensures:
 ## 🚀 Features
 
 ### EC2
-- **Create** instances (`ec2 create <os> <instance_type> [--key <keyname>]`)
+- **Create** instances (`ec2 create <os> <instance_type>`)
 - **List** instances created by this CLI
-- **Terminate** instances
-- **Generate key pairs** (`ec2 create ... --key <name>` automatically creates or reuses a key)
-- (Optional) **Describe** instance details (IPs, tags, launch time)
+- **Start** and **Stop** instances
+- **Terminate** instances (safe, tag-scoped)
+- **Generate key pairs** (`ec2 create <os> <instance_type>` auto-generates via prompt and saves a key pair)
+- **Describe** instance details (IPs, tags, launch time)
 
 ### S3
 - **Create** buckets (tagged + unique name validation)
@@ -97,6 +98,7 @@ aws configure
 ```
 project-cli ec2 create ubuntu t3.micro --region us-east-1
 project-cli ec2 list 
+project-cli ec2 describe (id or name from list), or --all for all
 project-cli ec2 terminate i-0123456789abcdef0 (id or name from list)
 ```
 
