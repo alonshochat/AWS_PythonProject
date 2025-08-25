@@ -21,6 +21,7 @@ The enforced tagging ensures:
 
 ### EC2
 - **Create** instances (`ec2 create <os> <instance_type>`)
+  - Includes prompts for instance name, key pair generation
 - **List** instances created by this CLI
 - **Start** and **Stop** instances
 - **Terminate** instances (safe, tag-scoped)
@@ -29,9 +30,10 @@ The enforced tagging ensures:
 
 ### S3
 - **Create** buckets (tagged + unique name validation)
+  - choose visibility (public/private) via prompt
 - **Upload** files
 - **Empty** files from buckets
-- **List** buckets and contents
+- **List** buckets (with size and object count)
 - **Delete** buckets (safe, tag-scoped)
 
 ### Route53
@@ -93,18 +95,22 @@ aws configure
 ### After installation, you can use the CLI as follows (Examples):
 * Each service has its own subcommands.
 * Use `--help` for detailed usage of each command.
+* Use `--examples` to see example commands.
 
 ### EC2
 ```
 project-cli ec2 create ubuntu t3.micro --region us-east-1
 project-cli ec2 list 
+project-cli ec2 start (id or name from list)
+project-cli ec2 stop (id or name from list)
 project-cli ec2 describe (id or name from list), or --all for all
-project-cli ec2 terminate i-0123456789abcdef0 (id or name from list)
+project-cli ec2 terminate (id or name from list)
 ```
 
 ### S3
 ```
-project-cli s3 create my-bucket --region us-east-1
+project-cli s3 create my-bucket
+project-cli s3 list
 project-cli s3 upload my-bucket ./file.txt
 project-cli s3 empty my-bucket 
 project-cli s3 delete my-bucket
@@ -112,10 +118,21 @@ project-cli s3 delete my-bucket
 
 ### Route53
 ```
+# Zones
 project-cli route53 list-zones
-project-cli route53 list-records Z123456ABCDEFG
-project-cli route53 create-record Z123456ABCDEFG --type A --name test.example.com --value 1.2.3.4 --ttl 300
-project-cli route53 delete-record Z123456ABCDEFG --type A --name test.example.com --value
+project-cli route53 create-zone example.com
+project-cli route53 delete-zone ZONE_ID --yes
+
+# Records
+project-cli route53 list-records ZONE_ID
+project-cli route53 create-record ZONE_ID NAME TYPE VALUE [TTL]
+project-cli route53 update-record ZONE_ID NAME TYPE VALUE [TTL]
+
+# Delete record (pick one)
+project-cli route53 delete-record ZONE_ID NAME TYPE --auto
+project-cli route53 delete-record ZONE_ID NAME TYPE VALUE [TTL]
+project-cli route53 delete-record ZONE_ID NAME TXT "value" --value-only
+
 ```
 
 ---
@@ -138,35 +155,42 @@ To avoid unexpected AWS costs, remove all resources created by this CLI when you
 ### EC2
 ```
 # List all project-cli instances
-project-cli ec2 list --region us-east-1
+project-cli ec2 list
 
 # Terminate an instance
-project-cli ec2 terminate i-0123456789abcdef0 --region us-east-1
+project-cli ec2 terminate (id or name from list)
 
 # (Repeat for all instances)
 ``` 
 ### S3
 ```
 # List all buckets
-project-cli s3 list --region us-east-1
+project-cli s3 list
 
-# Delete objects from a bucket
-project-cli s3 delete-object my-bucket file.txt --region us-east-1
+# Delete/Empty objects from a bucket
+project-cli s3 empty my-bucket
 
 # Delete the bucket itself
-project-cli s3 delete-bucket my-bucket --region us-east-1
+project-cli s3 delete my-bucket
 
 # (Repeat for all buckets)
 ```
 ### Route53
 ```
 # List records
-project-cli route53 records Z123456ABCDEFG --region us-east-1
+project-cli route53 list-zones
+project-cli route53 list-records ZONE_ID
 
-# Delete a record
-project-cli route53 delete-record Z123456ABCDEFG --type A --name test.example.com --value 1.2.3.4 --ttl 300
+# Delete a record (pick one of the modes)
+project-cli route53 delete-record ZONE_ID NAME TYPE --auto
+# or
+project-cli route53 delete-record ZONE_ID NAME TYPE VALUE [TTL]
+# or
+project-cli route53 delete-record ZONE_ID NAME TXT "value" --value-only
 
-# (Repeat for all records)
+# Delete zone (must have no custom records)
+project-cli route53 delete-zone ZONE_ID --yes
+
 ```
 ## Always double-check your AWS console to ensure all resources are deleted.
 

@@ -1,6 +1,6 @@
 # src/platform_cli/aws/route53.py
 
-from typing import Optional
+from typing import Optional, List, Dict
 import getpass
 import traceback
 from uuid import uuid4
@@ -44,6 +44,53 @@ def _zone_is_cli_owned(client, zone_id: str) -> bool:
         return tags.get("CreatedBy") == DEFAULT_TAGS["CreatedBy"]
     except ClientError:
         return False
+
+def _normalize_record_name(name: str) -> str:
+    return name if name.endswith(".") else name + "."
+
+def _quote_txt_if_needed(value: str) -> str:
+    """Ensure TXT value is double-quoted as Route53 expects."""
+    if value.startswith('"') and value.endswith('"'):
+        return value
+    return json.dumps(value)  # adds quotes + escapes
+
+def _get_rrset(client, zone_id: str, name: str, rtype: str) -> Optional[Dict]:
+    """
+    Fetch the exact RRSet for (name,type). Uses paginator with Start* to narrow scan.
+    Assumes simple records (no routing policies) for exam scope.
+    """
+    name = _normalize_record_name(name)
+    rtype = rtype.upper()
+    paginator = client.get_paginator("list_resource_record_sets")
+    for page in paginator.paginate(HostedZoneId=zone_id, StartRecordName=name, StartRecordType=rtype):
+        for rr in page.get("ResourceRecordSets", []):
+            if rr.get("Name") == name and rr.get("Type") == rtype:
+                return rr
+        last = page.get("ResourceRecordSets", [])[-1] if page.get("ResourceRecordSets") else None
+        if last and (last.get("Name", "") > name or (last.get("Name") == name and last.get("Type", "") > rtype)):
+            break
+    return None
+
+def _build_delete_change_from_rrset(rrset: Dict) -> Dict:
+    """Build a DELETE change that mirrors an existing RRSet (supports Alias)."""
+    base = {"Action": "DELETE", "ResourceRecordSet": {"Name": rrset["Name"], "Type": rrset["Type"]}}
+    rrs = base["ResourceRecordSet"]
+    if "AliasTarget" in rrset:
+        rrs["AliasTarget"] = rrset["AliasTarget"]
+        if "TTL" in rrset:
+            rrs["TTL"] = rrset["TTL"]
+        return base
+    if "TTL" in rrset:
+        rrs["TTL"] = rrset["TTL"]
+    if "ResourceRecords" in rrset:
+        rrs["ResourceRecords"] = rrset["ResourceRecords"]
+    return base
+
+def _values_equal(lhs: str, rhs: str, rtype: str) -> bool:
+    """Compare values (TXT aware)."""
+    if rtype.upper() == "TXT":
+        return _quote_txt_if_needed(lhs) == _quote_txt_if_needed(rhs)
+    return lhs == rhs
 
 
 # -----------------------------
@@ -361,19 +408,26 @@ def update_record(examples, zone_id, name, rtype, value, ttl, profile, debug):
 @click.argument("rtype", required=False, type=click.Choice(["A", "AAAA", "CNAME", "TXT"], case_sensitive=False))
 @click.argument("value", required=False)
 @click.argument("ttl", type=int, required=False, default=300)
+@click.option("--auto", is_flag=True, help="Auto-fetch current RRSet and delete it exactly (ignores provided ttl/value).")
+@click.option("--value-only", is_flag=True, help="Delete only the specified value from a multi-value RRSet (UPSERT remainder). Not valid for Alias records.")
 @click.option("--profile", default=None, help="AWS profile")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt")
 @click.option("--debug/--no-debug", default=False, help="Show full traceback on errors")
-def delete_record(examples, zone_id, name, rtype, value, ttl, profile, yes, debug):
-    """Delete a DNS record (only in CLI-created zones)."""
+def delete_record(examples, zone_id, name, rtype, value, ttl, auto, value_only, profile, yes, debug):
+    """Delete a DNS record (only in CLI-created zones). Supports --auto and --value-only modes."""
     if examples:
         click.echo(
             "Examples:\n"
-            "  project-cli route53 delete-record Z123ABCDEF www.example.com A 203.0.113.10 300\n"
+            "  # Strict delete (must match TTL & value):\n"
+            "  project-cli route53 delete-record Z123ABCDEF www.example.com A 203.0.113.10 300\n\n"
+            "  # Auto-delete entire RRSet by fetching current TTL/values:\n"
+            "  project-cli route53 delete-record Z123ABCDEF www.example.com A --auto\n\n"
+            "  # Remove a single value from a multi-value record (UPSERT remainder):\n"
+            "  project-cli route53 delete-record Z123ABCDEF www.example.com TXT \"hello world\" --value-only\n"
         )
         return
 
-    if not (zone_id and name and rtype and value):
+    if not (zone_id and name and rtype):
         click.echo("ERROR: Missing arguments.\nTry 'project-cli route53 delete-record -h' for help.", err=True)
         raise SystemExit(2)
 
@@ -388,31 +442,131 @@ def delete_record(examples, zone_id, name, rtype, value, ttl, profile, yes, debu
         click.echo("Refusing to delete: zone is not tagged CreatedBy=project-cli.", err=True)
         raise SystemExit(2)
 
-    record_name = name if name.endswith(".") else name + "."
+    record_name = _normalize_record_name(name)
     rtype = rtype.upper()
-    if rtype == "TXT":
-        record_value = json.dumps(value) if not (value.startswith('"') and value.endswith('"')) else value
-    else:
-        record_value = value
+
+    # Fetch current RRSet to support --auto/--value-only and to validate strict deletes
+    try:
+        current = _get_rrset(client, zone_id, record_name, rtype)
+    except ClientError as e:
+        click.echo(f"AWS error (list_resource_record_sets): {e}", err=True)
+        if debug:
+            traceback.print_exc()
+        raise SystemExit(2)
+
+    if not current:
+        click.echo(f"No existing RRSet found for {record_name} {rtype}.", err=True)
+        raise SystemExit(2)
+
+    is_alias = "AliasTarget" in current
+
+    # --value-only: UPSERT remainder (not for Alias)
+    if value_only:
+        if is_alias:
+            click.echo("Cannot use --value-only on Alias records.", err=True)
+            raise SystemExit(2)
+        if value is None:
+            click.echo("Missing VALUE for --value-only mode.", err=True)
+            raise SystemExit(2)
+        existing_vals = [r["Value"] for r in current.get("ResourceRecords", [])]
+        new_vals = [v for v in existing_vals if not _values_equal(v, value, rtype)]
+        if len(new_vals) == len(existing_vals):
+            click.echo("Specified value not found in RRSet; nothing to remove.", err=True)
+            raise SystemExit(2)
+
+        if not yes:
+            click.confirm(
+                f"Remove one value from {record_name} {rtype} (keep {len(new_vals)} of {len(existing_vals)})?",
+                abort=True
+            )
+
+        if new_vals:
+            change = {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                    "Name": current["Name"],
+                    "Type": current["Type"],
+                    "TTL": current.get("TTL", 300),
+                    "ResourceRecords": [{"Value": v} for v in new_vals],
+                },
+            }
+            try:
+                resp = client.change_resource_record_sets(
+                    HostedZoneId=zone_id,
+                    ChangeBatch={"Comment": "project-cli delete-record --value-only", "Changes": [change]},
+                )
+                change_id = resp["ChangeInfo"]["Id"].split("/")[-1]
+                click.echo(f"Value removed; RRSet updated ({rtype} TTL={current.get('TTL','-')}), change={change_id}")
+                return
+            except ClientError as e:
+                click.echo(f"AWS error (change_resource_record_sets UPSERT): {e}", err=True)
+                if debug:
+                    traceback.print_exc()
+                raise SystemExit(2)
+        else:
+            auto = True  # nothing left -> delete the RRSet
+
+    # --auto: delete exactly as stored
+    if auto:
+        delete_change = _build_delete_change_from_rrset(current)
+        if not yes:
+            if is_alias:
+                preview = f"ALIAS -> {current['AliasTarget'].get('DNSName', '-')}".rstrip(".")
+                click.confirm(f"Delete RRSet {record_name} {rtype} (Alias: {preview}) ?", abort=True)
+            else:
+                vals = [r["Value"] for r in current.get("ResourceRecords", [])]
+                click.confirm(f"Delete RRSet {record_name} {rtype} TTL={current.get('TTL','-')} values={vals} ?", abort=True)
+        try:
+            resp = client.change_resource_record_sets(
+                HostedZoneId=zone_id,
+                ChangeBatch={"Comment": "project-cli delete-record --auto", "Changes": [delete_change]},
+            )
+            change_id = resp["ChangeInfo"]["Id"].split("/")[-1]
+            click.echo(f"Record delete requested: {record_name} {rtype} change={change_id}")
+            return
+        except ClientError as e:
+            click.echo(f"AWS error (change_resource_record_sets DELETE): {e}", err=True)
+            if debug:
+                traceback.print_exc()
+            raise SystemExit(2)
+
+    # strict mode (legacy): require value & ttl to match exactly
+    if value is None:
+        click.echo("ERROR: VALUE is required unless you use --auto or --value-only.", err=True)
+        raise SystemExit(2)
+
+    if is_alias:
+        click.echo("Strict delete for Alias records is not supported; use --auto.", err=True)
+        raise SystemExit(2)
+
+    record_value = _quote_txt_if_needed(value) if rtype == "TXT" else value
+    cur_vals = [r["Value"] for r in current.get("ResourceRecords", [])]
+    cur_ttl = current.get("TTL", ttl)
+
+    if record_value not in cur_vals or (ttl != cur_ttl):
+        click.echo(
+            "Provided TTL/value do not match the current RRSet. "
+            f"Current TTL={cur_ttl}, values={cur_vals}. Use --auto to delete the exact RRSet.",
+            err=True,
+        )
+        raise SystemExit(2)
 
     if not yes:
-        click.confirm(f"Delete record {record_name} {rtype} {ttl}s value={value} ?", abort=True)
+        click.confirm(f"Delete record {record_name} {rtype} TTL={ttl} value={value} ?", abort=True)
 
+    change = {
+        "Action": "DELETE",
+        "ResourceRecordSet": {
+            "Name": record_name,
+            "Type": rtype,
+            "TTL": ttl,
+            "ResourceRecords": [{"Value": record_value}],
+        },
+    }
     try:
         resp = client.change_resource_record_sets(
             HostedZoneId=zone_id,
-            ChangeBatch={
-                "Comment": "project-cli delete-record",
-                "Changes": [{
-                    "Action": "DELETE",
-                    "ResourceRecordSet": {
-                        "Name": record_name,
-                        "Type": rtype,
-                        "TTL": ttl,
-                        "ResourceRecords": [{"Value": record_value}],
-                    },
-                }],
-            },
+            ChangeBatch={"Comment": "project-cli delete-record", "Changes": [change]},
         )
         change_id = resp["ChangeInfo"]["Id"].split("/")[-1]
         click.echo(f"Record delete requested: {record_name} {rtype} change={change_id}")
